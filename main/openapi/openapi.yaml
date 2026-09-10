@@ -1,0 +1,845 @@
+openapi: 3.0.3
+info:
+  title: Hotel Booking Service API
+  version: "1.0.0"
+  description: |
+    Backend-сервис бронирования номеров отеля.
+    Архитектура: HTTP-обработчик -> сервисный слой -> репозиторий (SQL) -> PostgreSQL.
+servers:
+  - url: http://localhost:8000
+    description: Локальный запуск через Docker Compose
+
+tags:
+  - name: health
+  - name: bookings
+  - name: guests
+  - name: rooms
+  - name: room-types
+  - name: services
+  - name: payments
+  - name: reports
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Проверка сервиса и подключения к PostgreSQL
+      responses:
+        "200":
+          description: Сервис работает, БД доступна
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  database: { type: string, example: ok }
+        "503":
+          description: Нет подключения к базе данных
+
+  /api/bookings:
+    get:
+      tags: [bookings]
+      summary: Список бронирований (JOIN с гостями, комнатами и типами комнат)
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 20, maximum: 200 } }
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, confirmed, checked_in, checked_out, cancelled]
+        - { in: query, name: guest_id, schema: { type: integer } }
+        - { in: query, name: room_id, schema: { type: integer } }
+        - { in: query, name: room_type_id, schema: { type: integer } }
+        - { in: query, name: check_in_from, schema: { type: string, format: date } }
+        - { in: query, name: check_in_to, schema: { type: string, format: date } }
+        - { in: query, name: created_from, schema: { type: string, format: date } }
+        - { in: query, name: created_to, schema: { type: string, format: date } }
+        - in: query
+          name: search
+          description: Поиск ILIKE по фамилии/имени гостя и номеру комнаты
+          schema: { type: string }
+        - in: query
+          name: sort
+          description: "Поле сортировки, минус — по убыванию"
+          schema:
+            type: string
+            enum: [id, -id, created_at, -created_at, check_in, -check_in, check_out, -check_out, total_price, -total_price]
+      responses:
+        "200":
+          description: Страница списка бронирований
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BookingPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    post:
+      tags: [bookings]
+      summary: Создать бронирование
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BookingInput" }
+      responses:
+        "201":
+          description: Бронирование создано
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/bookings/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [bookings]
+      summary: Карточка брони (JOIN + агрегат по платежам)
+      responses:
+        "200":
+          description: Бронирование
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BookingDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [bookings]
+      summary: Обновить бронирование
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BookingInput" }
+      responses:
+        "200":
+          description: Обновлённое бронирование
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [bookings]
+      summary: Удалить бронирование
+      description: Вместе с бронью удаляются её услуги (bookingservices) и платежи.
+      responses:
+        "200": { description: Бронирование удалено }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/bookings/{id}/services:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [bookings]
+      summary: Услуги брони (bookings -> bookingservices -> services)
+      responses:
+        "200":
+          description: Список услуг брони
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/BookingServiceLine" }
+                  total: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [bookings]
+      summary: Добавить услугу в бронь (связь many-to-many)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_service]
+              properties:
+                id_service: { type: integer }
+                quantity: { type: integer, default: 1, minimum: 1 }
+      responses:
+        "201": { description: Услуга добавлена }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/bookings/{id}/services/{service_id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+      - { in: path, name: service_id, required: true, schema: { type: integer } }
+    delete:
+      tags: [bookings]
+      summary: Убрать услугу из брони
+      responses:
+        "200": { description: Услуга удалена из брони }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/bookings/{id}/payments:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+      - { in: query, name: page, schema: { type: integer } }
+      - { in: query, name: page_size, schema: { type: integer } }
+    get:
+      tags: [bookings]
+      summary: Платежи по брони
+      responses:
+        "200":
+          description: Страница платежей
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/guests:
+    get:
+      tags: [guests]
+      summary: Список гостей
+      parameters:
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: page_size, schema: { type: integer } }
+        - { in: query, name: search, description: "ILIKE по фамилии, имени и email", schema: { type: string } }
+        - { in: query, name: email, schema: { type: string } }
+        - { in: query, name: sort, schema: { type: string, enum: [id, -id, last_name, -last_name, created_at, -created_at] } }
+      responses:
+        "200":
+          description: Страница списка гостей
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GuestPage" }
+    post:
+      tags: [guests]
+      summary: Создать гостя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GuestInput" }
+      responses:
+        "201":
+          description: Гость создан
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Guest" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/guests/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [guests]
+      summary: Гость по идентификатору
+      responses:
+        "200":
+          description: Гость
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Guest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [guests]
+      summary: Обновить гостя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GuestInput" }
+      responses:
+        "200":
+          description: Обновлённый гость
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Guest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [guests]
+      summary: Удалить гостя
+      responses:
+        "200": { description: Гость удалён }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/guests/{id}/bookings:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+      - { in: query, name: page, schema: { type: integer } }
+      - { in: query, name: page_size, schema: { type: integer } }
+      - { in: query, name: status, schema: { type: string } }
+      - { in: query, name: sort, schema: { type: string } }
+    get:
+      tags: [guests]
+      summary: Бронирования гостя
+      responses:
+        "200":
+          description: Страница бронирований гостя
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BookingPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/rooms:
+    get:
+      tags: [rooms]
+      summary: Список комнат (JOIN с типами комнат)
+      parameters:
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: page_size, schema: { type: integer } }
+        - { in: query, name: status, schema: { type: string, enum: [available, occupied, cleaning, maintenance] } }
+        - { in: query, name: room_type_id, schema: { type: integer } }
+        - { in: query, name: floor, schema: { type: integer } }
+        - { in: query, name: search, schema: { type: string } }
+        - { in: query, name: sort, schema: { type: string, enum: [id, -id, room_number, -room_number, floor, -floor, price, -price] } }
+      responses:
+        "200":
+          description: Страница списка комнат
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoomPage" }
+    post:
+      tags: [rooms]
+      summary: Создать комнату
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoomInput" }
+      responses:
+        "201": { description: Комната создана }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/rooms/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [rooms]
+      summary: Комната по идентификатору
+      responses:
+        "200":
+          description: Комната
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Room" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [rooms]
+      summary: Обновить комнату
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoomInput" }
+      responses:
+        "200": { description: Комната обновлена }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [rooms]
+      summary: Удалить комнату
+      responses:
+        "200": { description: Комната удалена }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/rooms/{id}/bookings:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+      - { in: query, name: page, schema: { type: integer } }
+      - { in: query, name: page_size, schema: { type: integer } }
+    get:
+      tags: [rooms]
+      summary: Бронирования комнаты
+      responses:
+        "200":
+          description: Страница бронирований комнаты
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BookingPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/room-types:
+    get:
+      tags: [room-types]
+      summary: Список типов комнат
+      parameters:
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: page_size, schema: { type: integer } }
+        - { in: query, name: search, schema: { type: string } }
+        - { in: query, name: price_max, schema: { type: number } }
+        - { in: query, name: sort, schema: { type: string, enum: [id, -id, name, -name, price, -price] } }
+      responses:
+        "200":
+          description: Страница списка типов комнат
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoomTypePage" }
+    post:
+      tags: [room-types]
+      summary: Создать тип комнаты
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoomTypeInput" }
+      responses:
+        "201": { description: Тип комнаты создан }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/room-types/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [room-types]
+      summary: Тип комнаты по идентификатору
+      responses:
+        "200":
+          description: Тип комнаты
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoomType" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [room-types]
+      summary: Обновить тип комнаты
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoomTypeInput" }
+      responses:
+        "200": { description: Тип комнаты обновлён }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [room-types]
+      summary: Удалить тип комнаты
+      responses:
+        "200": { description: Тип комнаты удалён }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/services:
+    get:
+      tags: [services]
+      summary: Список услуг
+      parameters:
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: page_size, schema: { type: integer } }
+        - { in: query, name: search, schema: { type: string } }
+        - { in: query, name: price_max, schema: { type: number } }
+        - { in: query, name: sort, schema: { type: string, enum: [id, -id, name, -name, price, -price] } }
+      responses:
+        "200":
+          description: Страница списка услуг
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServicePage" }
+    post:
+      tags: [services]
+      summary: Создать услугу
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceInput" }
+      responses:
+        "201": { description: Услуга создана }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/services/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [services]
+      summary: Услуга по идентификатору
+      responses:
+        "200":
+          description: Услуга
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Service" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [services]
+      summary: Обновить услугу
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceInput" }
+      responses:
+        "200": { description: Услуга обновлена }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [services]
+      summary: Удалить услугу
+      responses:
+        "200": { description: Услуга удалена }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/payments:
+    get:
+      tags: [payments]
+      summary: Список платежей (JOIN с бронированиями и гостями)
+      parameters:
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: page_size, schema: { type: integer } }
+        - { in: query, name: status, schema: { type: string, enum: [pending, success, partial, failed, refunded] } }
+        - { in: query, name: method, schema: { type: string, enum: [card, cash, transfer, online] } }
+        - { in: query, name: booking_id, schema: { type: integer } }
+        - { in: query, name: date_from, schema: { type: string, format: date } }
+        - { in: query, name: date_to, schema: { type: string, format: date } }
+        - { in: query, name: sort, schema: { type: string, enum: [id, -id, payment_date, -payment_date, amount, -amount, created_at, -created_at] } }
+      responses:
+        "200":
+          description: Страница списка платежей
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentPage" }
+    post:
+      tags: [payments]
+      summary: Создать платёж
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaymentInput" }
+      responses:
+        "201": { description: Платёж создан }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/payments/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: integer } }
+    get:
+      tags: [payments]
+      summary: Платёж по идентификатору
+      responses:
+        "200":
+          description: Платёж
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [payments]
+      summary: Обновить платёж
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaymentInput" }
+      responses:
+        "200": { description: Платёж обновлён }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [payments]
+      summary: Удалить платёж
+      responses:
+        "200": { description: Платёж удалён }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/reports/revenue-by-room-type:
+    get:
+      tags: [reports]
+      summary: Агрегирующий отчёт — выручка по типам номеров
+      parameters:
+        - { in: query, name: created_from, schema: { type: string, format: date } }
+        - { in: query, name: created_to, schema: { type: string, format: date } }
+        - { in: query, name: status, schema: { type: string } }
+      responses:
+        "200":
+          description: Агрегаты по типам номеров
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id_type: { type: integer }
+                        room_type: { type: string }
+                        bookings_count: { type: integer }
+                        total_revenue: { type: string }
+                        average_price: { type: string }
+                        min_price: { type: string }
+                        max_price: { type: string }
+                        total_nights: { type: integer }
+                  total_revenue: { type: string }
+                  total_bookings: { type: integer }
+
+  /api/reports/top-guests:
+    get:
+      tags: [reports]
+      summary: Агрегирующий отчёт — гости с наибольшей суммой бронирований
+      parameters:
+        - { in: query, name: created_from, schema: { type: string, format: date } }
+        - { in: query, name: created_to, schema: { type: string, format: date } }
+        - { in: query, name: limit, schema: { type: integer, default: 10, maximum: 100 } }
+      responses:
+        "200":
+          description: Топ гостей
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id_guest: { type: integer }
+                        last_name: { type: string }
+                        first_name: { type: string }
+                        email: { type: string }
+                        bookings_count: { type: integer }
+                        total_spent: { type: string }
+                        average_check: { type: string }
+                        last_check_out: { type: string, format: date }
+                  total: { type: integer }
+
+components:
+  responses:
+    BadRequest:
+      description: Некорректные данные запроса
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Конфликт данных (занятые даты, нарушение уникальности)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        details: { type: object }
+
+    Page:
+      type: object
+      properties:
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+
+    Booking:
+      type: object
+      properties:
+        id_booking: { type: integer }
+        id_guest: { type: integer }
+        id_room: { type: integer }
+        check_in: { type: string, format: date }
+        check_out: { type: string, format: date }
+        total_price: { type: string, example: "21000.00" }
+        status: { type: string, enum: [pending, confirmed, checked_in, checked_out, cancelled] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    BookingDetail:
+      allOf:
+        - $ref: "#/components/schemas/Booking"
+        - type: object
+          properties:
+            guest_last_name: { type: string }
+            guest_first_name: { type: string }
+            guest_email: { type: string }
+            guest_phone: { type: string }
+            room_number: { type: string }
+            floor: { type: integer }
+            room_type: { type: string }
+            price_per_night: { type: string }
+            paid_amount: { type: string }
+            payments_count: { type: integer }
+
+    BookingInput:
+      type: object
+      required: [id_guest, id_room, check_in, check_out]
+      properties:
+        id_guest: { type: integer }
+        id_room: { type: integer }
+        check_in: { type: string, format: date }
+        check_out: { type: string, format: date }
+        status: { type: string, enum: [pending, confirmed, checked_in, checked_out, cancelled], default: pending }
+        total_price:
+          type: string
+          description: Если не передано, считается как цена за ночь * количество ночей
+
+    BookingPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/BookingDetail" }
+
+    BookingServiceLine:
+      type: object
+      properties:
+        id_service: { type: integer }
+        name: { type: string }
+        price: { type: string }
+        quantity: { type: integer }
+        line_total: { type: string }
+        id_booking: { type: integer }
+        booking_status: { type: string }
+
+    Guest:
+      type: object
+      properties:
+        id_guest: { type: integer }
+        last_name: { type: string }
+        first_name: { type: string }
+        middle_name: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        passport_number: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    GuestInput:
+      type: object
+      required: [last_name, first_name]
+      properties:
+        last_name: { type: string }
+        first_name: { type: string }
+        middle_name: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        passport_number: { type: string, nullable: true }
+
+    GuestPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/Guest" }
+
+    Room:
+      type: object
+      properties:
+        id_room: { type: integer }
+        room_number: { type: string }
+        floor: { type: integer, nullable: true }
+        status: { type: string, enum: [available, occupied, cleaning, maintenance] }
+        id_type: { type: integer }
+        room_type: { type: string }
+        price_per_night: { type: string }
+
+    RoomInput:
+      type: object
+      required: [room_number, id_type]
+      properties:
+        room_number: { type: string }
+        id_type: { type: integer }
+        floor: { type: integer, nullable: true }
+        status: { type: string, enum: [available, occupied, cleaning, maintenance], default: available }
+
+    RoomPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/Room" }
+
+    RoomType:
+      type: object
+      properties:
+        id_type: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        price_per_night: { type: string }
+
+    RoomTypeInput:
+      type: object
+      required: [name, price_per_night]
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        price_per_night: { type: string }
+
+    RoomTypePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/RoomType" }
+
+    Service:
+      type: object
+      properties:
+        id_service: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        price: { type: string }
+
+    ServiceInput:
+      type: object
+      required: [name, price]
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        price: { type: string }
+
+    ServicePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/Service" }
+
+    Payment:
+      type: object
+      properties:
+        id_payment: { type: integer }
+        id_booking: { type: integer }
+        payment_date: { type: string, format: date }
+        amount: { type: string }
+        method: { type: string, enum: [card, cash, transfer, online] }
+        status: { type: string, enum: [pending, success, partial, failed, refunded] }
+        created_at: { type: string, format: date-time }
+        id_guest: { type: integer }
+        guest_last_name: { type: string }
+        guest_first_name: { type: string }
+
+    PaymentInput:
+      type: object
+      required: [id_booking, payment_date, amount, method]
+      properties:
+        id_booking: { type: integer }
+        payment_date: { type: string, format: date }
+        amount: { type: string }
+        method: { type: string, enum: [card, cash, transfer, online] }
+        status: { type: string, enum: [pending, success, partial, failed, refunded], default: pending }
+
+    PaymentPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/Payment" }

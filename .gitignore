@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Django
+*.log
+db.sqlite3
+staticfiles/
+
+# Среда разработки
+.env
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Локальные черновики документации
+README.md
+PROJECT_DESCRIPTION.md
+RUN.md
