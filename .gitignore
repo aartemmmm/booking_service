@@ -24,7 +24,6 @@ staticfiles/
 alerts/
 
 # Локальные черновики документации
-README.md
 PROJECT_DESCRIPTION.md
 RUN.md
 
