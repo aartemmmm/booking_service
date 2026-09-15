@@ -1,10 +1,19 @@
 """
 Единственное место, где приложение обращается к PostgreSQL.
 
-Все репозитории выполняют SQL через соединение Django (settings.DATABASES['default']).
+Подключения (settings.DATABASES):
+  PRIMARY ('default') — Primary: все записи и чтение по умолчанию;
+  REPLICA ('replica') — Replica: только чтение, для read-сценариев,
+                        которым допустимо небольшое отставание данных.
+
+Функции чтения принимают параметр using и по умолчанию идут на Primary.
+execute() всегда выполняется на Primary: Replica принимает только чтение.
 """
 
-from django.db import connection
+from django.db import connections
+
+PRIMARY = 'default'
+REPLICA = 'replica'
 
 
 def _rows_to_dicts(cursor):
@@ -12,39 +21,43 @@ def _rows_to_dicts(cursor):
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
-def query_all(sql, params=None):
+def query_all(sql, params=None, using=PRIMARY):
     """Вернуть все строки результата в виде списка словарей."""
-    with connection.cursor() as cursor:
+    with connections[using].cursor() as cursor:
         cursor.execute(sql, params or [])
         return _rows_to_dicts(cursor)
 
 
-def query_one(sql, params=None):
+def query_one(sql, params=None, using=PRIMARY):
     """Вернуть первую строку результата или None."""
-    with connection.cursor() as cursor:
+    with connections[using].cursor() as cursor:
         cursor.execute(sql, params or [])
         rows = _rows_to_dicts(cursor)
     return rows[0] if rows else None
 
 
-def scalar(sql, params=None):
+def scalar(sql, params=None, using=PRIMARY):
     """Вернуть первое поле первой строки (COUNT, SUM и т.п.)."""
-    with connection.cursor() as cursor:
+    with connections[using].cursor() as cursor:
         cursor.execute(sql, params or [])
         row = cursor.fetchone()
     return row[0] if row else None
 
 
 def execute(sql, params=None):
-    """Выполнить INSERT/UPDATE/DELETE без RETURNING, вернуть число затронутых строк."""
-    with connection.cursor() as cursor:
+    """
+    Выполнить INSERT/UPDATE/DELETE без RETURNING, вернуть число затронутых строк.
+
+    Запись всегда идёт на Primary — единственный экземпляр, принимающий изменения.
+    """
+    with connections[PRIMARY].cursor() as cursor:
         cursor.execute(sql, params or [])
         return cursor.rowcount
 
 
-def ping():
+def ping(using=PRIMARY):
     """Проверка доступности БД для /health."""
-    with connection.cursor() as cursor:
+    with connections[using].cursor() as cursor:
         cursor.execute('SELECT 1')
         cursor.fetchone()
     return True

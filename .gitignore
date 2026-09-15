@@ -20,7 +20,18 @@ staticfiles/
 # macOS
 .DS_Store
 
+# Письма локального почтового бэкенда
+alerts/
+
 # Локальные черновики документации
 README.md
 PROJECT_DESCRIPTION.md
 RUN.md
+
+# Вспомогательные заметки к лабораторным (в репозиторий идут только отчёты)
+docs/lab-03-files.md
+docs/lab-03-partitioning-guide.md
+docs/lab-03-pg-cron.md
+docs/lab-04-files.md
+docs/lab-05-files.md
+docs/lab-06-files.md

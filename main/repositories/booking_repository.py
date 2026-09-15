@@ -1,6 +1,6 @@
 """SQL-запросы к основной растущей сущности bookings."""
 
-from .base import build_where, execute, order_by_clause, query_all, query_one, scalar
+from .base import REPLICA, build_where, execute, order_by_clause, query_all, query_one, scalar
 
 # Поля, по которым разрешена сортировка (?sort=created_at / ?sort=-created_at)
 SORT_FIELDS = {
@@ -88,6 +88,10 @@ def _filters(params):
     return conditions, values
 
 
+# Список бронирований (GET /api/bookings и списки по гостю/комнате) читается
+# с Replica: это самый частый и тяжёлый read-сценарий API, а небольшое
+# отставание списка от Primary для него допустимо. Всё остальное, включая
+# карточку брони и любую запись, по-прежнему идёт на Primary.
 def list_bookings(params, limit, offset, sort=None):
     conditions, values = _filters(params)
     sql = f"""
@@ -96,7 +100,7 @@ def list_bookings(params, limit, offset, sort=None):
         ORDER BY {order_by_clause(sort, SORT_FIELDS, DEFAULT_ORDER)}
         LIMIT %s OFFSET %s
     """
-    return query_all(sql, values + [limit, offset])
+    return query_all(sql, values + [limit, offset], using=REPLICA)
 
 
 def count_bookings(params):
@@ -109,7 +113,7 @@ def count_bookings(params):
         JOIN roomtypes rt ON rt.id_type = r.id_type
         {build_where(conditions)}
     """
-    return scalar(sql, values) or 0
+    return scalar(sql, values, using=REPLICA) or 0
 
 
 def get_booking(booking_id):

@@ -1,30 +1,183 @@
 services:
+  # Primary: основной экземпляр PostgreSQL. Принимает все записи
+  # (INSERT / UPDATE / DELETE) и передаёт поток WAL на Replica.
   postgres:
-    image: postgres:16-alpine
+    # PostgreSQL с расширением pg_cron (см. deploy/postgres/Dockerfile)
+    build: ./deploy/postgres
+    image: booking-postgres-pgcron
     container_name: booking_postgres
+    # Параметры сервера передаются в командной строке, а не через postgresql.conf,
+    # потому что конфиг лежит внутри тома с данными и не хранится в репозитории.
+    command:
+      - postgres
+      # --- pg_cron (лаба 3) ---
+      #   shared_preload_libraries — загрузить планировщик вместе с сервером;
+      #   cron.database_name       — база, в которой живут задачи расписания;
+      #   cron.use_background_workers — выполнять задачи фоновыми процессами;
+      #   cron.timezone            — часовой пояс расписания.
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=booking_service
+      - -c
+      - cron.use_background_workers=on
+      - -c
+      - cron.timezone=UTC
+      - -c
+      - max_worker_processes=20
+      # --- репликация (лаба 4) ---
+      #   hba_file — правила доступа из репозитория, в том числе разрешение
+      #              replication-подключений (см. deploy/postgres/pg_hba.conf);
+      #   wal_level=replica — в WAL записывается всё, что нужно реплике для
+      #              воспроизведения изменений (значение по умолчанию, задано явно);
+      #   max_slot_wal_keep_size — слот реплики удерживает WAL, пока реплика его
+      #              не заберёт; лимит защищает диск Primary, если реплика надолго остановлена.
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - wal_level=replica
+      - -c
+      - max_slot_wal_keep_size=2GB
     environment:
       POSTGRES_DB: booking_service
       POSTGRES_USER: booking
       POSTGRES_PASSWORD: booking
+      # Роль, под которой Replica подключается к Primary за WAL
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      # Скрипты первой инициализации: роль репликации, функции и расписание pg_cron.
+      # На пустом томе выполняются автоматически, на существующей базе — вручную.
+      - ./deploy/postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U booking -d booking_service"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # Replica: hot standby, копия Primary только для чтения. При первом запуске
+  # копирует данные с Primary (pg_basebackup), дальше непрерывно воспроизводит
+  # его WAL через streaming replication.
+  postgres-replica:
+    image: booking-postgres-pgcron
+    container_name: booking_postgres_replica
+    entrypoint: ["replica-entrypoint.sh"]
+    command:
+      - postgres
+      # Те же расширения и лимиты, что на Primary. max_worker_processes на реплике
+      # не может быть меньше, чем на Primary, иначе hot standby не запустится.
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=booking_service
+      - -c
+      - cron.use_background_workers=on
+      - -c
+      - cron.timezone=UTC
+      - -c
+      - max_worker_processes=20
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      # hot_standby=on — принимать read-only подключения во время воспроизведения WAL
+      - -c
+      - hot_standby=on
+      # Логировать каждый выполненный запрос с именем приложения — так видно,
+      # что чтение сервиса действительно приходит на Replica
+      - -c
+      - log_min_duration_statement=0
+      - -c
+      - "log_line_prefix=%m [%p] app=%a db=%d "
+    environment:
+      POSTGRES_DB: booking_service
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      PRIMARY_HOST: postgres
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      REPLICATION_SLOT: replica_1
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./deploy/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking_service"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Шарды бронирований: три независимых PostgreSQL. Между ними нет репликации —
+  # у каждого своя часть данных. Какой шард хранит бронь, решает router
+  # в backend по ключу id_guest (main/sharding/router.py).
+  postgres-shard-0:
+    image: postgres:16-alpine
+    container_name: booking_shard_0
+    environment: &shard-env
+      POSTGRES_DB: booking_shard
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+    ports:
+      - "5440:5432"
+    volumes:
+      - shard_0_data:/var/lib/postgresql/data
+      # Схема таблицы bookings на шарде — создаётся при первой инициализации
+      - ./deploy/postgres/shard-initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck: &shard-healthcheck
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking_shard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-shard-1:
+    image: postgres:16-alpine
+    container_name: booking_shard_1
+    environment: *shard-env
+    ports:
+      - "5441:5432"
+    volumes:
+      - shard_1_data:/var/lib/postgresql/data
+      - ./deploy/postgres/shard-initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck: *shard-healthcheck
+
+  postgres-shard-2:
+    image: postgres:16-alpine
+    container_name: booking_shard_2
+    environment: *shard-env
+    ports:
+      - "5442:5432"
+    volumes:
+      - shard_2_data:/var/lib/postgresql/data
+      - ./deploy/postgres/shard-initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck: *shard-healthcheck
+
   backend:
     build: .
     container_name: booking_backend
     environment:
+      # Primary — записи и чтение по умолчанию
       POSTGRES_DB: booking_service
       POSTGRES_USER: booking
       POSTGRES_PASSWORD: booking
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
+      # Replica — список бронирований читается отсюда (settings.DATABASES['replica'])
+      POSTGRES_REPLICA_HOST: postgres-replica
+      POSTGRES_REPLICA_PORT: 5432
+      # Шарды бронирований (settings.DATABASES['shard_0'..'shard_2'])
+      SHARD_0_HOST: postgres-shard-0
+      SHARD_0_PORT: 5432
+      SHARD_1_HOST: postgres-shard-1
+      SHARD_1_PORT: 5432
+      SHARD_2_HOST: postgres-shard-2
+      SHARD_2_PORT: 5432
       DJANGO_DEBUG: "true"
       DJANGO_ALLOWED_HOSTS: "*"
       SEED_DEMO_DATA: "true"
@@ -33,8 +186,39 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+      postgres-shard-0:
+        condition: service_healthy
+      postgres-shard-1:
+        condition: service_healthy
+      postgres-shard-2:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  # Доставка уведомлений о партициях. Проверку по расписанию выполняет pg_cron
+  # внутри базы; база сама писем не отправляет, а подаёт сигнал NOTIFY —
+  # этот процесс его слушает и отправляет письмо через email-бэкенд Django.
+  partition-alerts:
+    build: .
+    container_name: booking_partition_alerts
+    entrypoint: ["python", "manage.py", "partition_alert_listener"]
+    environment:
+      POSTGRES_DB: booking_service
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - .:/app
 
 volumes:
   postgres_data:
+  postgres_replica_data:
+  shard_0_data:
+  shard_1_data:
+  shard_2_data:
