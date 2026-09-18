@@ -46,9 +46,10 @@ WSGI_APPLICATION = 'booking_service.wsgi.application'
 ASGI_APPLICATION = 'booking_service.asgi.application'
 
 # Подключения к PostgreSQL. Реальные SQL-запросы выполняются в слое main/repositories.
-#   'default' — Primary: все записи (INSERT/UPDATE/DELETE) и чтение по умолчанию;
-#   'replica' — Replica: часть операций чтения (список бронирований), которым
-#               допустимо небольшое отставание данных (replication lag).
+#   'default'   — Primary: все записи (INSERT/UPDATE/DELETE) и чтение по умолчанию;
+#   'replica-1' — Replica: список и подсчёт бронирований (main/repositories/booking_repository.py);
+#   'replica-2' — вторая Replica: список гостей (main/repositories/guest_repository.py).
+# Обеим репликам допустимо небольшое отставание данных (replication lag).
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -63,20 +64,29 @@ DATABASES = {
     },
 }
 
-# Если хост реплики не задан, alias 'replica' указывает на Primary, и сервис
-# работает без реплики. Соединение при этом всё равно открывается в режиме
-# только чтения (default_transaction_read_only), поэтому запись через 'replica'
-# невозможна ни при какой конфигурации.
-DATABASES['replica'] = {
+# Если хост реплики не задан переменной окружения, алиас указывает на Primary,
+# и сервис работает без реплики. Соединение при этом всё равно открывается
+# в режиме только чтения (default_transaction_read_only), поэтому запись
+# через 'replica-1' / 'replica-2' невозможна ни при какой конфигурации.
+DATABASES['replica-1'] = {
     **DATABASES['default'],
-    'HOST': os.getenv('POSTGRES_REPLICA_HOST') or DATABASES['default']['HOST'],
-    'PORT': os.getenv('POSTGRES_REPLICA_PORT') or DATABASES['default']['PORT'],
+    'HOST': os.getenv('POSTGRES_REPLICA_1_HOST') or DATABASES['default']['HOST'],
+    'PORT': os.getenv('POSTGRES_REPLICA_1_PORT') or DATABASES['default']['PORT'],
     'OPTIONS': {
-        'application_name': 'booking-backend-replica',
+        'application_name': 'booking-backend-replica-1',
         'options': '-c default_transaction_read_only=on',
     },
 }
 
+DATABASES['replica-2'] = {
+    **DATABASES['default'],
+    'HOST': os.getenv('POSTGRES_REPLICA_2_HOST') or DATABASES['default']['HOST'],
+    'PORT': os.getenv('POSTGRES_REPLICA_2_PORT') or DATABASES['default']['PORT'],
+    'OPTIONS': {
+        'application_name': 'booking-backend-replica-2',
+        'options': '-c default_transaction_read_only=on',
+    },
+}
 # Шарды бронирований: независимые экземпляры PostgreSQL, между которыми
 # распределяется таблица bookings. Порядок в списке важен — по нему router
 # нумерует шарды (hash(id_guest) % N выбирает индекс в этом списке).

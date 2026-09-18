@@ -1,4 +1,4 @@
-"""Маршруты API. Все обработчики находятся в main/api/views.py."""
+"""Маршруты API. Обработчики — в пакете main/api/views/, по файлу на ресурс."""
 
 from django.urls import re_path
 

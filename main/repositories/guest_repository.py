@@ -39,7 +39,7 @@ def list_guests(params, limit, offset, sort=None):
         ORDER BY {order_by_clause(sort, SORT_FIELDS, DEFAULT_ORDER)}
         LIMIT %s OFFSET %s
     """
-    return query_all(sql, values + [limit, offset])
+    return query_all(sql, values + [limit, offset], using='replica-2')
 
 
 def count_guests(params):

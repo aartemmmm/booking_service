@@ -13,7 +13,7 @@ execute() всегда выполняется на Primary: Replica приним
 from django.db import connections
 
 PRIMARY = 'default'
-REPLICA = 'replica'
+REPLICA = 'replica-1'
 
 
 def _rows_to_dicts(cursor):

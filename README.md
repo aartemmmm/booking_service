@@ -25,18 +25,24 @@ ORM используется только для описания схемы и 
 docker compose up
 ```
 
-Поднимается семь контейнеров — базовый сервис плюс инфраструктура, добавленная
+Поднимается восемь контейнеров — базовый сервис плюс инфраструктура, добавленная
 лабораторными работами 3–5:
 
-| Сервис             | Порт на хосте | Volume                  | Описание                                                    |
-|--------------------|---------------|-------------------------|-------------------------------------------------------------|
-| `postgres`         | 5433          | `postgres_data`         | Primary: основная база, секции и pg_cron (лабы 1–3)         |
-| `postgres-replica` | 5434          | `postgres_replica_data` | Replica: потоковая репликация, чтение (лаба 4)              |
-| `postgres-shard-0` | 5440          | `shard_0_data`          | шард 0 с таблицей `bookings` (лабы 5–6)                     |
-| `postgres-shard-1` | 5441          | `shard_1_data`          | шард 1                                                      |
-| `postgres-shard-2` | 5442          | `shard_2_data`          | шард 2                                                      |
-| `backend`          | 8000          | —                       | Django-приложение с REST API                                |
-| `partition-alerts` | —             | —                       | слушатель `LISTEN/NOTIFY` для уведомлений о секциях (лаба 3) |
+| Сервис              | Порт на хосте | Volume                   | Описание                                                      |
+| --- | --- | --- | --- |
+| `postgres`          | 5433          | `postgres_data`          | Primary: основная база, секции и pg_cron (лабы 1–3)           |
+| `postgres-replica`  | 5434          | `postgres_replica_data`  | Replica: потоковая репликация, читает список броней (лаба 4)  |
+| `postgres-replica2` | 5436          | `postgres_replica2_data` | вторая Replica: читает список гостей                          |
+| `postgres-shard-0`  | 5440          | `shard_0_data`           | шард 0 с таблицей `bookings` (лабы 5–6)                       |
+| `postgres-shard-1`  | 5441          | `shard_1_data`           | шард 1                                                        |
+| `postgres-shard-2`  | 5442          | `shard_2_data`           | шард 2                                                        |
+| `backend`           | 8000          | —                        | Django-приложение с REST API                                  |
+| `partition-alerts`  | —             | —                        | слушатель `LISTEN/NOTIFY` для уведомлений о секциях (лаба 3)  |
+
+Каждая реплика — независимая потоковая копия всего кластера (физическая репликация
+реплицирует весь `PGDATA`, а не отдельные таблицы); то, что `replica` обслуживает
+только брони, а `replica2` — только гостей, решает не PostgreSQL, а backend: он выбирает
+алиас подключения (`replica-1` / `replica-2`) в зависимости от того, какую сущность читает.
 
 Внутри сети Docker все базы слушают штатный порт `5432`; разные порты на хосте нужны
 только чтобы подключаться к ним снаружи одновременно.
@@ -65,7 +71,7 @@ docker compose up
 ```
 Client
   ↓
-HTTP-обработчик        main/api/views.py      разбор запроса, коды ответов, JSON
+HTTP-обработчик        main/api/views/*.py    разбор запроса, коды ответов, JSON
   ↓
 Сервисный слой         main/services/*.py     валидация, бизнес-правила
   ↓
@@ -74,13 +80,19 @@ HTTP-обработчик        main/api/views.py      разбор запро�
 PostgreSQL
 ```
 
-* `main/api/views.py`, `main/api/http.py` — контроллеры. К базе напрямую не обращаются.
+* `main/api/views/` — контроллеры, по файлу на ресурс: `system.py` (health, docs, openapi),
+  `bookings.py`, `guests.py`, `rooms.py` (номера и типы номеров), `services.py`,
+  `payments.py`, `reports.py`, `errors.py` (обработчики 404/500). `__init__.py` собирает
+  их вместе, поэтому маршруты обращаются к ним как `views.<имя>`.
+* `main/api/http.py` — декоратор `endpoint`, разбор тела запроса, JSON-ответы и ошибки.
+  К базе контроллеры напрямую не обращаются.
 * `main/services/` — бизнес-логика: проверка дат, пересечений броней, расчёт стоимости,
   валидация входных данных, пагинация.
 * `main/repositories/` — единственное место, где выполняется SQL.
   Подключение выбирается в `main/repositories/base.py`: константы `PRIMARY` (`'default'`)
-  и `REPLICA` (`'replica'`), функции чтения принимают аргумент `using`, запись всегда
-  идёт на Primary (настройки — `booking_service/settings.py`, словарь `DATABASES`).
+  и `REPLICA` (`'replica-1'`), функции чтения принимают аргумент `using`, запись всегда
+  идёт на Primary. `guest_repository.py` отдельно ходит на `'replica-2'` — вторую реплику
+  (настройки — `booking_service/settings.py`, словарь `DATABASES`).
 * `main/sharding/` — router шардирования: `ModuloRouter` и `ConsistentHashRouter`
   (лаба 5); `main/repositories/sharded_booking_repository.py` — SQL к шардам.
 * `main/models.py` — описание схемы для системы миграций Django.
@@ -178,7 +190,7 @@ bookings
 | 1 | [lab-01-indexes.md](docs/lab-01-indexes.md) | Индексы и `EXPLAIN ANALYZE` | индексы в `Meta.indexes` модели `Booking`, миграция `0002` |
 | 2 | [lab-02-data-growth.md](docs/lab-02-data-growth.md) | Деградация при росте данных | схема `lab2`, замеры на таблице `events`; команда `generate_data` |
 | 3 | [lab-03-partitioning.md](docs/lab-03-partitioning.md) | Партиционирование и автоматизация через `pg_cron` | схема `lab3`, [10-partitions-pg-cron.sql](deploy/postgres/initdb/10-partitions-pg-cron.sql), команды `create_partitions`, `check_partitions`, `partition_alert_listener` |
-| 4 | [lab-04-read-scaling.md](docs/lab-04-read-scaling.md) | Масштабирование чтения: Primary + Replica | сервис `postgres-replica`, [replica-entrypoint.sh](deploy/postgres/replica-entrypoint.sh), `DATABASES['replica']`, команда `replication_status` |
+| 4 | [lab-04-read-scaling.md](docs/lab-04-read-scaling.md) | Масштабирование чтения: Primary + Replica | сервис `postgres-replica`, [replica-entrypoint.sh](deploy/postgres/replica-entrypoint.sh), `DATABASES['replica-1']`, команда `replication_status` |
 | 5 | [lab-05-sharding.md](docs/lab-05-sharding.md) | Шардирование: router и consistent hashing | три шарда, [main/sharding/](main/sharding/), `sharded_booking_repository.py`, команда `shard_bookings` |
 | 6 | [lab-06-sharded-queries.md](docs/lab-06-sharded-queries.md) | Запросы сервиса после шардирования | команда `shard_queries` (single / count / join / top / hot / failure) |
 
@@ -395,6 +407,7 @@ docker compose down              # остановить, данные в volume 
 docker compose exec backend python manage.py migrate          # миграции вручную
 docker compose exec postgres psql -U booking booking_service  # psql на Primary
 docker compose exec postgres-replica psql -U booking booking_service  # psql на Replica
+docker compose exec postgres-replica2 psql -U booking booking_service # psql на второй Replica
 docker compose exec postgres-shard-0 psql -U booking booking_shard   # psql на шарде
 ```
 

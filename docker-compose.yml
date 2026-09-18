@@ -114,6 +114,61 @@ services:
       timeout: 5s
       retries: 30
 
+  postgres-replica2:
+    image: booking-postgres-pgcron
+    container_name: booking_postgres_replica2
+    entrypoint: ["replica-entrypoint.sh"]
+    command:
+      - postgres
+      # Те же расширения и лимиты, что на Primary. max_worker_processes на реплике
+      # не может быть меньше, чем на Primary, иначе hot standby не запустится.
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=booking_service
+      - -c
+      - cron.use_background_workers=on
+      - -c
+      - cron.timezone=UTC
+      - -c
+      - max_worker_processes=20
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      # hot_standby=on — принимать read-only подключения во время воспроизведения WAL
+      - -c
+      - hot_standby=on
+      # Логировать каждый выполненный запрос с именем приложения — так видно,
+      # что чтение сервиса действительно приходит на Replica
+      - -c
+      - log_min_duration_statement=0
+      - -c
+      - "log_line_prefix=%m [%p] app=%a db=%d "
+    environment:
+      POSTGRES_DB: booking_service
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      PRIMARY_HOST: postgres
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      REPLICATION_SLOT: replica_2
+    ports:
+      - "5436:5432"
+    volumes:
+      # Свой volume: два сервера PostgreSQL не могут одновременно работать
+      # с одним и тем же каталогом данных.
+      - postgres_replica2_data:/var/lib/postgresql/data
+      - ./deploy/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking_service"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+
   # Шарды бронирований: три независимых PostgreSQL. Между ними нет репликации —
   # у каждого своя часть данных. Какой шард хранит бронь, решает router
   # в backend по ключу id_guest (main/sharding/router.py).
@@ -168,9 +223,11 @@ services:
       POSTGRES_PASSWORD: booking
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      # Replica — список бронирований читается отсюда (settings.DATABASES['replica'])
-      POSTGRES_REPLICA_HOST: postgres-replica
-      POSTGRES_REPLICA_PORT: 5432
+      # Реплики — settings.DATABASES['replica-1'] (брони) и ['replica-2'] (гости)
+      POSTGRES_REPLICA_1_HOST: postgres-replica
+      POSTGRES_REPLICA_1_PORT: 5432
+      POSTGRES_REPLICA_2_HOST: postgres-replica2
+      POSTGRES_REPLICA_2_PORT: 5432
       # Шарды бронирований (settings.DATABASES['shard_0'..'shard_2'])
       SHARD_0_HOST: postgres-shard-0
       SHARD_0_PORT: 5432
@@ -187,6 +244,8 @@ services:
       postgres:
         condition: service_healthy
       postgres-replica:
+        condition: service_healthy
+      postgres-replica2:
         condition: service_healthy
       postgres-shard-0:
         condition: service_healthy
@@ -219,6 +278,7 @@ services:
 volumes:
   postgres_data:
   postgres_replica_data:
+  postgres_replica2_data:
   shard_0_data:
   shard_1_data:
   shard_2_data:
